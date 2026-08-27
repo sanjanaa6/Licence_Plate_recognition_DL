@@ -1,0 +1,52 @@
+# Python Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.python-version
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook Checkpoints & Caches
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+.launch/
+
+# Deep Learning / Model Weights & Runs
+runs/
+*.pt
+*.pth
+*.onnx
+*.weights
+*.bin
+*.safetensors
+*.engine
+*.tflite
+
+# Kaggle / Dataset & Credentials
+kaggle.json
+data/
+data_raw/
+*.zip
+*.tar.gz
+
+# Media / Temporary Test Outputs
+_tmp_*
+*.mp4
+*.avi
+*.mov
+sample_car_result.jpg
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
