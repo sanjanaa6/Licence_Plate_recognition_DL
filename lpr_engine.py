@@ -4,9 +4,11 @@ License Plate Recognition (LPR / ANPR) Core Engine
 Features:
 - Padded bounding-box extraction to prevent character clipping.
 - Deskewing & rotation alignment for angled plates.
-- Preprocessing (CLAHE, Bilateral filtering, Sharpening).
-- Multi-Engine OCR (EasyOCR / PyTesseract / Custom Contour OCR).
-- Syntax-Aware Positional Character Correction (e.g. Indian standard format: MH 12 AB 1234).
+- Morphological TopHat / BlackHat + Sobel X Edge License Plate Localizer.
+- Multi-pass Binarization (CLAHE, Otsu Adaptive Binarization, Inversion).
+- 2-Line License Plate Splitter & Horizontal Stacker.
+- Dual-Engine OCR (EasyOCR / PyTesseract / Contour Fallback).
+- Positional Syntax-Aware Character Correction (e.g. Indian standard format: MH 12 AB 1234).
 """
 
 import cv2
@@ -159,33 +161,48 @@ def deskew_plate(crop_bgr: np.ndarray) -> np.ndarray:
     return rotated
 
 
-def preprocess_plate_crop(crop_bgr: np.ndarray, target_height: int = 128) -> np.ndarray:
+def preprocess_multi_pass(crop_bgr: np.ndarray, target_height: int = 128) -> Dict[str, np.ndarray]:
     """
-    Applies resolution scaling, CLAHE contrast boost, and adaptive sharpening.
+    Generates multi-pass preprocessed variants (BGR, Grayscale CLAHE, Otsu Binarized, 2-Line Stacked).
     """
     if crop_bgr is None or crop_bgr.size == 0:
-        return crop_bgr
+        return {}
 
     h, w = crop_bgr.shape[:2]
     if h == 0 or w == 0:
-        return crop_bgr
+        return {}
+    
     scale = target_height / float(h)
-    new_w = max(16, int(w * scale))
-    resized = cv2.resize(crop_bgr, (new_w, target_height), interpolation=cv2.INTER_CUBIC)
+    new_w = max(32, int(w * scale))
+    resized_bgr = cv2.resize(crop_bgr, (new_w, target_height), interpolation=cv2.INTER_CUBIC)
 
-    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    # 1. CLAHE Grayscale
+    gray = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    enhanced_lab = cv2.merge((cl, a, b))
-    enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+    clahe_gray = clahe.apply(gray)
 
-    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]], dtype=np.float32)
-    sharpened = cv2.filter2D(enhanced_bgr, -1, kernel)
-    return sharpened
+    # 2. Otsu Binarization (Black text on white background)
+    _, otsu = cv2.threshold(clahe_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(otsu) < 127:
+        otsu = cv2.bitwise_not(otsu)
+
+    # 3. 2-Line Plate Stacker (if aspect ratio < 3.2, likely 2-line plate)
+    aspect_ratio = w / float(h)
+    stacked_bgr = resized_bgr.copy()
+    if aspect_ratio < 3.2 and h >= 30:
+        top_half = resized_bgr[0:target_height//2, :]
+        bot_half = resized_bgr[target_height//2:, :]
+        stacked_bgr = np.hstack([top_half, bot_half])
+
+    return {
+        "bgr": resized_bgr,
+        "clahe_bgr": cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR),
+        "otsu_bgr": cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR),
+        "stacked_bgr": stacked_bgr
+    }
 
 
-def crop_with_padding(image: np.ndarray, bbox: Tuple[int, int, int, int], margin_pct: float = 0.08) -> np.ndarray:
+def crop_with_padding(image: np.ndarray, bbox: Tuple[int, int, int, int], margin_pct: float = 0.10) -> np.ndarray:
     """
     Extracts crop with safety margin padding around bbox coordinates (x1, y1, x2, y2).
     """
@@ -205,6 +222,58 @@ def crop_with_padding(image: np.ndarray, bbox: Tuple[int, int, int, int], margin
     return image[py1:py2, px1:px2]
 
 
+def localize_license_plate_opencv(image_bgr: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
+    """
+    Locates license plate bounding boxes using Morphological TopHat/BlackHat + Sobel X edge density.
+    Pinpoints rectangular plates across light, dark, shadowed, and angled vehicle bumpers.
+    """
+    h_img, w_img = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # 1. Morphological Rectangular Kernel
+    rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, rect_kernel)
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rect_kernel)
+    
+    # Combine TopHat (light plate) and BlackHat (dark text/border)
+    enhanced = cv2.add(gray, cv2.subtract(tophat, blackhat))
+    
+    # 2. Sobel X Gradient (high vertical edge density for character sequences)
+    grad_x = cv2.Sobel(enhanced, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
+    grad_x = np.absolute(grad_x)
+    min_val, max_val = np.min(grad_x), np.max(grad_x)
+    if max_val > 0:
+        grad_x = (255 * ((grad_x - min_val) / (max_val - min_val))).astype("uint8")
+    else:
+        grad_x = grad_x.astype("uint8")
+        
+    blurred = cv2.GaussianBlur(grad_x, (5, 5), 0)
+    thresh = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, rect_kernel)
+    _, thresh = cv2.threshold(thresh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    square_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh = cv2.erode(thresh, square_kernel, iterations=1)
+    thresh = cv2.dilate(thresh, square_kernel, iterations=2)
+
+    cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
+    boxes = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        aspect_ratio = w / float(h)
+        area = w * h
+        
+        # License Plate Aspect Ratio typical range: 1.8 to 6.8
+        if 1.8 <= aspect_ratio <= 6.8 and w >= 40 and h >= 12 and (area / float(w_img * h_img)) < 0.40:
+            score = 1.0 - abs(aspect_ratio - 3.8) / 3.8
+            conf = max(0.55, min(0.95, round(score, 2)))
+            boxes.append((x, y, x + w, y + h, conf))
+            
+    boxes = sorted(boxes, key=lambda b: b[4], reverse=True)
+    return boxes
+
+
 class LPREngine:
     """
     Unified LPR Pipeline managing detection models, OCR readers, and post-processing.
@@ -218,8 +287,6 @@ class LPREngine:
             import os
             if detector_weights and os.path.exists(detector_weights):
                 self.detector = YOLO(detector_weights)
-            else:
-                self.detector = YOLO("yolov8n.pt")
         except Exception:
             pass
 
@@ -227,16 +294,23 @@ class LPREngine:
         if self.easyocr_reader is None:
             try:
                 import easyocr
-                self.easyocr_reader = easyocr.Reader(['en'], gpu=gpu)
+                self.easyocr_reader = easyocr.Reader(['en'], gpu=gpu, verbose=False)
             except Exception:
                 pass
 
     def detect_plates(self, image_bgr: np.ndarray, conf_thresh: float = 0.35) -> List[Tuple[int, int, int, int, float]]:
         """
-        Detects license plates in image. Returns list of (x1, y1, x2, y2, confidence).
-        Falls back to contour-based rectangular shape detector if YOLO fails.
+        Detects license plates in image.
+        Uses OpenCV TopHat/BlackHat Morphological Localizer + YOLO detection.
         """
         boxes = []
+        
+        # 1. Morphological TopHat / BlackHat License Plate Localizer (High Accuracy for Plates)
+        morph_boxes = localize_license_plate_opencv(image_bgr)
+        if morph_boxes:
+            boxes.extend(morph_boxes[:3])  # Top 3 plate candidates
+
+        # 2. YOLO Detector if trained model weights exist
         if self.detector is not None:
             try:
                 results = self.detector(image_bgr, conf=conf_thresh, verbose=False)
@@ -245,62 +319,58 @@ class LPREngine:
                         x1, y1, x2, y2 = map(int, b.xyxy[0].cpu().numpy())
                         conf = float(b.conf[0].cpu().numpy())
                         boxes.append((x1, y1, x2, y2, conf))
-                if boxes:
-                    return boxes
             except Exception:
                 pass
-
-        # Contour-Based Plate Detector Fallback
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.bilateralFilter(gray, 11, 17, 17)
-        edged = cv2.Canny(blurred, 30, 200)
-        cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:15]
-
-        h_img, w_img = image_bgr.shape[:2]
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.018 * peri, True)
-            if len(approx) == 4:
-                x, y, w, h = cv2.boundingRect(approx)
-                aspect_ratio = w / float(h)
-                if 2.0 <= aspect_ratio <= 6.0 and w > 60 and h > 15:
-                    boxes.append((x, y, x + w, y + h, 0.50))
-                    break
         
         if not boxes:
+            h_img, w_img = image_bgr.shape[:2]
             boxes.append((0, 0, w_img, h_img, 0.10))
 
         return boxes
 
-    def run_ocr(self, crop_bgr: np.ndarray, engine: str = "easyocr") -> str:
+    def run_ocr_pass(self, crop_variants: Dict[str, np.ndarray], engine: str = "easyocr") -> str:
         """
-        Runs OCR on a preprocessed crop image using EasyOCR, PyTesseract, or OpenCV fallback.
+        Executes multi-pass OCR on image variants and picks the candidate with highest syntax score.
         """
-        if crop_bgr is None or crop_bgr.size == 0:
-            return ""
+        candidates = []
 
-        # 1. Try EasyOCR
-        if engine == "easyocr":
-            self.init_easyocr()
-            if self.easyocr_reader is not None:
+        # 1. EasyOCR Multi-pass
+        self.init_easyocr()
+        if self.easyocr_reader is not None:
+            for name, crop in crop_variants.items():
                 try:
-                    res = self.easyocr_reader.readtext(crop_bgr, detail=0, paragraph=False)
-                    return "".join(res)
+                    res = self.easyocr_reader.readtext(crop, detail=0, paragraph=False)
+                    txt = "".join(res)
+                    if txt:
+                        candidates.append(txt)
                 except Exception:
                     pass
 
-        # 2. Try PyTesseract
-        try:
-            import pytesseract
-            gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-            txt = pytesseract.image_to_string(gray, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-            if txt.strip():
-                return txt.strip()
-        except Exception:
-            pass
+        # 2. PyTesseract Fallback Multi-pass
+        if not candidates:
+            try:
+                import pytesseract
+                for name, crop in crop_variants.items():
+                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    txt = pytesseract.image_to_string(gray, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                    if txt.strip():
+                        candidates.append(txt.strip())
+            except Exception:
+                pass
 
-        return ""
+        if not candidates:
+            return ""
+
+        # Rank candidates by syntax correctness score
+        best_candidate = candidates[0]
+        for cand in candidates:
+            corr, valid, _ = correct_plate_syntax(cand)
+            if valid:
+                return cand
+            if len(re.sub(r"[^A-Z0-9]", "", cand)) > len(re.sub(r"[^A-Z0-9]", "", best_candidate)):
+                best_candidate = cand
+
+        return best_candidate
 
     def process_image(self, image_input: Union[str, np.ndarray], conf_thresh: float = 0.35, ocr_engine: str = "easyocr") -> Dict:
         """
@@ -319,11 +389,11 @@ class LPREngine:
         for box in boxes:
             x1, y1, x2, y2, det_conf = box
             
-            crop_padded = crop_with_padding(image, (x1, y1, x2, y2), margin_pct=0.08)
+            crop_padded = crop_with_padding(image, (x1, y1, x2, y2), margin_pct=0.10)
             crop_aligned = deskew_plate(crop_padded)
-            crop_enhanced = preprocess_plate_crop(crop_aligned)
+            crop_variants = preprocess_multi_pass(crop_aligned)
             
-            raw_text = self.run_ocr(crop_enhanced, engine=ocr_engine)
+            raw_text = self.run_ocr_pass(crop_variants, engine=ocr_engine)
             corrected_text, is_valid, format_type = correct_plate_syntax(raw_text)
 
             results.append({
@@ -333,7 +403,7 @@ class LPREngine:
                 "corrected_text": corrected_text,
                 "is_valid": is_valid,
                 "format_type": format_type,
-                "crop_enhanced": crop_enhanced
+                "crop_enhanced": crop_variants.get("clahe_bgr", crop_aligned)
             })
 
         return {
