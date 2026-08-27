@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 import re
 import math
+import sys
+import traceback
 from typing import List, Dict, Tuple, Optional, Union
 
 # Character Substitution Mappings for OCR Confusion Resolution
@@ -110,7 +112,7 @@ def correct_plate_syntax(raw_text: str) -> Tuple[str, bool, str]:
         if state_candidate in INDIAN_STATES:
             return candidate_ns, True, "Indian Format (State-Verified)"
 
-    # 3. Universal / International License Plate Format (3 to 12 alphanumeric characters)
+    # 3. Universal / International License Plate Format (3 to 14 alphanumeric characters)
     if 3 <= len(no_spaces) <= 14:
         return cleaned, True, "Universal / International Plate"
         
@@ -263,14 +265,29 @@ def localize_license_plate_opencv(image_bgr: np.ndarray) -> List[Tuple[int, int,
     return boxes
 
 
+# Global Singleton Reader for Instant Memory Reuse
+_GLOBAL_EASYOCR_READER = None
+
+def get_easyocr_reader():
+    global _GLOBAL_EASYOCR_READER
+    if _GLOBAL_EASYOCR_READER is None:
+        try:
+            import easyocr
+            print("[LPR Engine] Initializing global EasyOCR reader...")
+            _GLOBAL_EASYOCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
+            print("[LPR Engine] Global EasyOCR reader ready.")
+        except Exception as e:
+            print(f"[LPR Engine] Failed to initialize EasyOCR: {e}")
+            traceback.print_exc()
+    return _GLOBAL_EASYOCR_READER
+
+
 class LPREngine:
     """
     Unified LPR Pipeline managing detection models, OCR readers, and post-processing.
     """
     def __init__(self, detector_weights: Optional[str] = None):
         self.detector = None
-        self.easyocr_reader = None
-        
         try:
             from ultralytics import YOLO
             import os
@@ -278,14 +295,6 @@ class LPREngine:
                 self.detector = YOLO(detector_weights)
         except Exception:
             pass
-
-    def init_easyocr(self, gpu: bool = False):
-        if self.easyocr_reader is None:
-            try:
-                import easyocr
-                self.easyocr_reader = easyocr.Reader(['en'], gpu=gpu, verbose=False)
-            except Exception:
-                pass
 
     def detect_plates(self, image_bgr: np.ndarray, conf_thresh: float = 0.35) -> List[Tuple[int, int, int, int, float]]:
         """
@@ -322,24 +331,22 @@ class LPREngine:
         """
         candidates = []
 
-        # 1. EasyOCR Multi-pass
-        self.init_easyocr()
-        if self.easyocr_reader is not None:
+        reader = get_easyocr_reader()
+        if reader is not None:
             for name, crop in crop_variants.items():
                 try:
-                    # Pass 1A: detail=0 (fast sentence extraction)
-                    raw_lines = self.easyocr_reader.readtext(crop, detail=0, paragraph=False)
+                    # Pass 1A: detail=0 (fast full line recognition)
+                    raw_lines = reader.readtext(crop, detail=0, paragraph=False)
                     if raw_lines:
                         full_line = " ".join([re.sub(r"[^A-Z0-9 ]", "", t.upper()) for t in raw_lines]).strip()
                         if full_line:
                             candidates.append(full_line)
 
-                    # Pass 1B: detail=1 (token level confidence analysis)
-                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False)
+                    # Pass 1B: detail=1 (token level confidence & position analysis)
+                    res = reader.readtext(crop, detail=1, paragraph=False)
                     valid_tokens = []
                     for bbox, text, prob in res:
                         cleaned_tok = re.sub(r"[^A-Z0-9]", "", text.upper())
-                        # Ignore noise headers like 'GAUTENG' or tiny emblem letters
                         if len(cleaned_tok) >= 1 and cleaned_tok not in KNOWN_NOISE_TOKENS:
                             valid_tokens.append(cleaned_tok)
                             
@@ -351,7 +358,8 @@ class LPREngine:
                             stripped_str = " ".join(valid_tokens[1:])
                             candidates.append(stripped_str)
                 except Exception as e:
-                    pass
+                    print(f"[LPR Engine] Error during OCR variant '{name}': {e}")
+                    traceback.print_exc()
 
         # 2. PyTesseract Fallback
         if not candidates:

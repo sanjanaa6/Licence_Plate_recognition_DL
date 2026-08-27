@@ -85,8 +85,8 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 📌 Format Verification Rules")
 st.sidebar.info("Supported: Indian Standard (`MH12AB1234`), Bharat Series (`22BH1234AA`), & Universal International Plates (`JC 12 CG GP`)")
 
+@st.cache_resource
 def get_lpr_engine():
-    importlib.reload(lpr_engine)
     return LPREngine()
 
 engine = get_lpr_engine()
