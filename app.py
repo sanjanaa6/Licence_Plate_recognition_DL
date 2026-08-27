@@ -8,6 +8,13 @@ import time
 import pandas as pd
 import importlib
 
+# Safe session state recovery block for upgraded Streamlit instances
+try:
+    for k in list(st.session_state.keys()):
+        pass
+except Exception:
+    st.session_state.clear()
+
 import lpr_engine
 from lpr_engine import LPREngine, correct_plate_syntax
 
@@ -90,6 +97,7 @@ enable_syntax_correction = st.sidebar.checkbox("Enable Positional Syntax Correct
 
 if st.sidebar.button("🔄 Reload LPR Engine & Clear Cache", key="reload_btn_key"):
     st.cache_resource.clear()
+    st.session_state.clear()
     importlib.reload(lpr_engine)
     st.sidebar.success("Engine & Cache reloaded!")
 
