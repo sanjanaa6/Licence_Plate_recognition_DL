@@ -7,8 +7,8 @@ Features:
 - Morphological TopHat / BlackHat + Sobel X Edge License Plate Localizer.
 - Multi-pass Binarization (CLAHE, Otsu Adaptive Binarization, Inversion).
 - 2-Line License Plate Splitter & Horizontal Stacker.
-- Dual-Engine OCR (EasyOCR / PyTesseract / Contour Fallback).
-- Positional Syntax-Aware Character Correction (e.g. Indian standard format: MH 12 AB 1234).
+- Multi-Engine OCR with Confidence Filtering & Space Preservation.
+- Syntax-Aware Character Correction for Indian & Universal International Plates.
 """
 
 import cv2
@@ -59,67 +59,57 @@ RE_INDIAN_BH = re.compile(r"^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$")
 
 def correct_plate_syntax(raw_text: str) -> Tuple[str, bool, str]:
     """
-    Applies position-aware syntax correction for Indian standard license plates.
+    Validates and formats license plate text across Indian & International formats.
+    Preserves exact character predictions with natural spacing (e.g. JC 12 CG GP, MH 12 AB 1234).
     
     Returns:
         (corrected_text, is_valid, format_type)
     """
-    cleaned = re.sub(r"[^A-Z0-9]", "", raw_text.upper())
-    if not cleaned:
+    cleaned = re.sub(r"[^A-Z0-9 ]", "", raw_text.upper()).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    
+    no_spaces = cleaned.replace(" ", "")
+    if not no_spaces:
         return "", False, "unknown"
     
-    # Check if already strictly valid
-    if RE_INDIAN_STD.match(cleaned):
+    # 1. Check if strictly matches Indian Standard or Bharat Series
+    if RE_INDIAN_STD.match(no_spaces):
         return cleaned, True, "Indian Standard"
-    if RE_INDIAN_BH.match(cleaned):
+    if RE_INDIAN_BH.match(no_spaces):
         return cleaned, True, "Bharat Series"
     
-    # Positional Syntax Correction Engine
-    if 8 <= len(cleaned) <= 11:
-        chars = list(cleaned)
+    # 2. Attempt Positional Syntax Correction for Indian Standard Format
+    if 8 <= len(no_spaces) <= 11 and (no_spaces[:2] in INDIAN_STATES or (no_spaces[2].isdigit() and no_spaces[3].isdigit())):
+        chars = list(no_spaces)
         n = len(chars)
         
-        # 1. First 2 characters MUST BE State Code (Letters)
+        # State Code (first 2 letters)
         for i in range(min(2, n)):
             if chars[i] in DICT_NUM_TO_CHAR:
                 chars[i] = DICT_NUM_TO_CHAR[chars[i]]
                 
-        # 2. Last 4 characters MUST BE Registration Digits (Digits)
+        # Registration Digits (last 4 digits)
         for i in range(max(0, n - 4), n):
             if chars[i] in DICT_CHAR_TO_NUM:
                 chars[i] = DICT_CHAR_TO_NUM[chars[i]]
                 
-        # 3. Handle District (digits) vs Series (letters)
-        if n == 10:
-            for i in (2, 3):
+        # District Code (digits at pos 2 & 3)
+        if n >= 4:
+            for i in range(2, min(4, n)):
                 if chars[i] in DICT_CHAR_TO_NUM:
                     chars[i] = DICT_CHAR_TO_NUM[chars[i]]
-            for i in (4, 5):
-                if chars[i] in DICT_NUM_TO_CHAR:
-                    chars[i] = DICT_NUM_TO_CHAR[chars[i]]
-        elif n == 9:
-            if chars[2] in DICT_CHAR_TO_NUM:
-                chars[2] = DICT_CHAR_TO_NUM[chars[2]]
-            if chars[4] in DICT_NUM_TO_CHAR:
-                chars[4] = DICT_NUM_TO_CHAR[chars[4]]
-        elif n == 11:
-            for i in (2, 3):
-                if chars[i] in DICT_CHAR_TO_NUM:
-                    chars[i] = DICT_CHAR_TO_NUM[chars[i]]
-            for i in (4, 5, 6):
-                if chars[i] in DICT_NUM_TO_CHAR:
-                    chars[i] = DICT_NUM_TO_CHAR[chars[i]]
 
-        candidate = "".join(chars)
+        candidate_ns = "".join(chars)
+        if RE_INDIAN_STD.match(candidate_ns):
+            return candidate_ns, True, "Indian Standard (Syntax-Corrected)"
         
-        if RE_INDIAN_STD.match(candidate):
-            return candidate, True, "Indian Standard (Syntax-Corrected)"
-        
-        state_candidate = candidate[:2]
+        state_candidate = candidate_ns[:2]
         if state_candidate in INDIAN_STATES:
-            return candidate, True, "Indian Format (State-Verified)"
-            
-        return candidate, False, "Uncertain Format"
+            return candidate_ns, True, "Indian Format (State-Verified)"
+
+    # 3. Universal / International License Plate Format (3 to 12 alphanumeric characters)
+    if 3 <= len(no_spaces) <= 12:
+        return cleaned, True, "Universal / International Plate"
         
     return cleaned, False, "Non-Standard Format"
 
@@ -235,7 +225,6 @@ def localize_license_plate_opencv(image_bgr: np.ndarray) -> List[Tuple[int, int,
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, rect_kernel)
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rect_kernel)
     
-    # Combine TopHat (light plate) and BlackHat (dark text/border)
     enhanced = cv2.add(gray, cv2.subtract(tophat, blackhat))
     
     # 2. Sobel X Gradient (high vertical edge density for character sequences)
@@ -331,18 +320,25 @@ class LPREngine:
     def run_ocr_pass(self, crop_variants: Dict[str, np.ndarray], engine: str = "easyocr") -> str:
         """
         Executes multi-pass OCR on image variants and picks the candidate with highest syntax score.
+        Preserves natural word spacing (e.g. 'JC 12 CG GP').
         """
         candidates = []
 
-        # 1. EasyOCR Multi-pass
+        # 1. EasyOCR Multi-pass with Confidence & Space Preservation
         self.init_easyocr()
         if self.easyocr_reader is not None:
             for name, crop in crop_variants.items():
                 try:
-                    res = self.easyocr_reader.readtext(crop, detail=0, paragraph=False)
-                    txt = "".join(res)
-                    if txt:
-                        candidates.append(txt)
+                    # Use detail=1 to extract individual text segments + confidence scores
+                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False)
+                    valid_tokens = []
+                    for bbox, text, prob in res:
+                        cleaned_tok = re.sub(r"[^A-Z0-9]", "", text.upper())
+                        if len(cleaned_tok) >= 1 and prob >= 0.20:
+                            valid_tokens.append(cleaned_tok)
+                    if valid_tokens:
+                        full_str = " ".join(valid_tokens)
+                        candidates.append(full_str)
                 except Exception:
                     pass
 
@@ -352,22 +348,25 @@ class LPREngine:
                 import pytesseract
                 for name, crop in crop_variants.items():
                     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    txt = pytesseract.image_to_string(gray, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-                    if txt.strip():
-                        candidates.append(txt.strip())
+                    txt = pytesseract.image_to_string(gray, config="--psm 7")
+                    txt_clean = re.sub(r"[^A-Z0-9 ]", "", txt.upper()).strip()
+                    if txt_clean:
+                        candidates.append(txt_clean)
             except Exception:
                 pass
 
         if not candidates:
             return ""
 
-        # Rank candidates by syntax correctness score
+        # Rank candidates by syntax correctness score and character count
         best_candidate = candidates[0]
         for cand in candidates:
-            corr, valid, _ = correct_plate_syntax(cand)
+            corr, valid, fmt = correct_plate_syntax(cand)
             if valid:
                 return cand
-            if len(re.sub(r"[^A-Z0-9]", "", cand)) > len(re.sub(r"[^A-Z0-9]", "", best_candidate)):
+            cand_ns = re.sub(r"[^A-Z0-9]", "", cand)
+            best_ns = re.sub(r"[^A-Z0-9]", "", best_candidate)
+            if len(cand_ns) > len(best_ns):
                 best_candidate = cand
 
         return best_candidate
