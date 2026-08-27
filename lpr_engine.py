@@ -7,8 +7,7 @@ Features:
 - Morphological TopHat / BlackHat + Sobel X Edge License Plate Localizer.
 - Multi-pass Binarization (CLAHE, Otsu Adaptive Binarization, Inversion).
 - 2-Line License Plate Splitter & Horizontal Stacker.
-- Isolated Character Contour Segmentation & Left-to-Right Sorting Engine.
-- Multi-Engine OCR with Alphanumeric Allowlist & Emblem Badge Stripping.
+- Multi-Engine OCR with Robust Text Extraction & Emblem Stripping.
 - Universal Character Prediction for Indian & International License Plates.
 """
 
@@ -53,8 +52,8 @@ INDIAN_STATES = {
     "UP", "WB", "BH"
 }
 
-# Country / State Emblem Badges to Ignore
-KNOWN_EMBLEM_BADGES = {"IND", "ZA", "GB", "EU", "USA", "UK", "NL", "GER", "FR", "AUS"}
+# Country / State Emblem Badges & Header Noise to Strip
+KNOWN_NOISE_TOKENS = {"IND", "ZA", "GB", "EU", "USA", "UK", "NL", "GER", "FR", "AUS", "GAUTENG", "TEXAS", "CALIFORNIA"}
 
 # Standard Indian License Plate Regex Patterns
 RE_INDIAN_STD = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$")
@@ -112,7 +111,7 @@ def correct_plate_syntax(raw_text: str) -> Tuple[str, bool, str]:
             return candidate_ns, True, "Indian Format (State-Verified)"
 
     # 3. Universal / International License Plate Format (3 to 12 alphanumeric characters)
-    if 3 <= len(no_spaces) <= 12:
+    if 3 <= len(no_spaces) <= 14:
         return cleaned, True, "Universal / International Plate"
         
     return cleaned, False, "Non-Standard Format"
@@ -194,46 +193,6 @@ def preprocess_multi_pass(crop_bgr: np.ndarray, target_height: int = 128) -> Dic
         "otsu_bgr": cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR),
         "stacked_bgr": stacked_bgr
     }
-
-
-def extract_character_boxes(crop_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    """
-    Finds individual character contours sorted left-to-right across the plate crop.
-    """
-    h_crop, w_crop = crop_bgr.shape[:2]
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
-    
-    thresh = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 9)
-    cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    char_boxes = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        aspect = w / float(h)
-        rel_h = h / float(h_crop)
-        rel_w = w / float(w_crop)
-        
-        # Filter for characters (exclude tiny noise and full border)
-        if 0.22 <= rel_h <= 0.85 and 0.02 <= rel_w <= 0.35 and 0.12 <= aspect <= 1.6:
-            char_boxes.append((x, y, w, h))
-            
-    # Sort character boxes left-to-right along X axis
-    char_boxes = sorted(char_boxes, key=lambda b: b[0])
-    
-    # Merge overlapping bounding boxes
-    filtered = []
-    for box in char_boxes:
-        if not filtered:
-            filtered.append(box)
-        else:
-            prev_x, prev_y, prev_w, prev_h = filtered[-1]
-            x, y, w, h = box
-            # If current box overlaps heavily with previous box, skip duplicate
-            if abs(x - prev_x) > 6:
-                filtered.append(box)
-                
-    return filtered
 
 
 def crop_with_padding(image: np.ndarray, bbox: Tuple[int, int, int, int], margin_pct: float = 0.10) -> np.ndarray:
@@ -358,67 +317,49 @@ class LPREngine:
 
     def run_ocr_pass(self, crop_variants: Dict[str, np.ndarray], engine: str = "easyocr") -> str:
         """
-        Executes multi-pass OCR on image variants + Isolated Character Segmentation Fallback.
-        Applies Alphanumeric Allowlist & Emblem Badge Stripping.
+        Executes multi-pass OCR across preprocessed crop variants.
+        Extracts raw text tokens, strips header/emblem noise, and selects optimal plate prediction.
         """
         candidates = []
 
-        # 1. EasyOCR Multi-pass with Alphanumeric Allowlist
+        # 1. EasyOCR Multi-pass
         self.init_easyocr()
         if self.easyocr_reader is not None:
             for name, crop in crop_variants.items():
                 try:
-                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                    # Pass 1A: detail=0 (fast sentence extraction)
+                    raw_lines = self.easyocr_reader.readtext(crop, detail=0, paragraph=False)
+                    if raw_lines:
+                        full_line = " ".join([re.sub(r"[^A-Z0-9 ]", "", t.upper()) for t in raw_lines]).strip()
+                        if full_line:
+                            candidates.append(full_line)
+
+                    # Pass 1B: detail=1 (token level confidence analysis)
+                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False)
                     valid_tokens = []
                     for bbox, text, prob in res:
                         cleaned_tok = re.sub(r"[^A-Z0-9]", "", text.upper())
-                        if len(cleaned_tok) >= 1 and prob >= 0.05:
+                        # Ignore noise headers like 'GAUTENG' or tiny emblem letters
+                        if len(cleaned_tok) >= 1 and cleaned_tok not in KNOWN_NOISE_TOKENS:
                             valid_tokens.append(cleaned_tok)
                             
                     if valid_tokens:
                         full_str = " ".join(valid_tokens)
                         candidates.append(full_str)
                         
-                        if len(valid_tokens) > 1 and (valid_tokens[0] in KNOWN_EMBLEM_BADGES or len(valid_tokens[0]) <= 3):
+                        if len(valid_tokens) > 1 and (valid_tokens[0] in KNOWN_NOISE_TOKENS or len(valid_tokens[0]) <= 3):
                             stripped_str = " ".join(valid_tokens[1:])
                             candidates.append(stripped_str)
-                except Exception:
+                except Exception as e:
                     pass
 
-        # 2. Isolated Character Contour Segmentation Fallback Engine
-        if not candidates or max([len(re.sub(r"[^A-Z0-9]", "", c)) for c in candidates], default=0) < 4:
-            base_crop = crop_variants.get("bgr")
-            if base_crop is not None and self.easyocr_reader is not None:
-                char_boxes = extract_character_boxes(base_crop)
-                h_crop, w_crop = base_crop.shape[:2]
-                segmented_chars = []
-                for x, y, w, h in char_boxes:
-                    pad = 4
-                    px1, py1 = max(0, x - pad), max(0, y - pad)
-                    px2, py2 = min(w_crop, x + w + pad), min(h_crop, y + h + pad)
-                    char_subcrop = base_crop[py1:py2, px1:px2]
-                    if char_subcrop.size == 0:
-                        continue
-                    char_scaled = cv2.resize(char_subcrop, (64, 64), interpolation=cv2.INTER_CUBIC)
-                    try:
-                        c_res = self.easyocr_reader.readtext(char_scaled, detail=0, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
-                        if c_res:
-                            c_str = re.sub(r"[^A-Z0-9]", "", "".join(c_res).upper())
-                            if c_str:
-                                segmented_chars.append(c_str[0])
-                    except Exception:
-                        pass
-                if len(segmented_chars) >= 3:
-                    seg_predicted = "".join(segmented_chars)
-                    candidates.append(seg_predicted)
-
-        # 3. PyTesseract Fallback Multi-pass
+        # 2. PyTesseract Fallback
         if not candidates:
             try:
                 import pytesseract
                 for name, crop in crop_variants.items():
                     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    txt = pytesseract.image_to_string(gray, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                    txt = pytesseract.image_to_string(gray, config="--psm 7")
                     txt_clean = re.sub(r"[^A-Z0-9 ]", "", txt.upper()).strip()
                     if txt_clean:
                         candidates.append(txt_clean)
@@ -428,9 +369,20 @@ class LPREngine:
         if not candidates:
             return ""
 
-        # Rank candidates: prioritize candidates that match valid plate syntax
-        valid_candidates = []
+        # Clean and deduplicate candidates
+        clean_candidates = []
         for cand in candidates:
+            c_str = re.sub(r"[^A-Z0-9 ]", "", cand.upper()).strip()
+            c_str = re.sub(r"\s+", " ", c_str)
+            if c_str and c_str not in clean_candidates:
+                clean_candidates.append(c_str)
+
+        if not clean_candidates:
+            return ""
+
+        # Rank candidates: prioritize valid syntax, then longest character count
+        valid_candidates = []
+        for cand in clean_candidates:
             corr, valid, fmt = correct_plate_syntax(cand)
             if valid:
                 valid_candidates.append((cand, corr, fmt))
@@ -439,8 +391,8 @@ class LPREngine:
             valid_candidates.sort(key=lambda x: len(re.sub(r"[^A-Z0-9]", "", x[1])), reverse=True)
             return valid_candidates[0][1]
 
-        candidates.sort(key=lambda x: len(re.sub(r"[^A-Z0-9]", "", x)), reverse=True)
-        return candidates[0]
+        clean_candidates.sort(key=lambda x: len(re.sub(r"[^A-Z0-9]", "", x)), reverse=True)
+        return clean_candidates[0]
 
     def process_image(self, image_input: Union[str, np.ndarray], conf_thresh: float = 0.35, ocr_engine: str = "easyocr") -> Dict:
         """
