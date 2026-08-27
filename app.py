@@ -6,7 +6,9 @@ import tempfile
 import os
 import time
 import pandas as pd
+import importlib
 
+import lpr_engine
 from lpr_engine import LPREngine, correct_plate_syntax
 
 # Streamlit Page Config
@@ -33,26 +35,32 @@ st.markdown("""
         color: #9CA3AF;
         margin-bottom: 1.5rem;
     }
-    .metric-card {
-        background-color: #1F2937;
-        padding: 1rem;
+    .result-text-box {
+        font-size: 1.8rem;
+        font-weight: bold;
+        letter-spacing: 2px;
+        color: #10B981;
+        background-color: #111827;
+        padding: 0.75rem 1rem;
         border-radius: 0.5rem;
-        border: 1px solid #374151;
-        margin-bottom: 1rem;
+        border: 2px solid #059669;
+        margin: 0.5rem 0;
     }
     .badge-valid {
         background-color: #059669;
         color: white;
-        padding: 0.25rem 0.5rem;
+        padding: 0.35rem 0.65rem;
         border-radius: 0.25rem;
         font-weight: bold;
+        font-size: 0.95rem;
     }
     .badge-invalid {
         background-color: #D97706;
         color: white;
-        padding: 0.25rem 0.5rem;
+        padding: 0.35rem 0.65rem;
         border-radius: 0.25rem;
         font-weight: bold;
+        font-size: 0.95rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -68,15 +76,20 @@ ocr_engine = st.sidebar.selectbox("OCR Engine", ["easyocr", "tesseract_fallback"
 enable_deskew = st.sidebar.checkbox("Enable Deskew / Rotation Correction", value=True)
 enable_syntax_correction = st.sidebar.checkbox("Enable Positional Syntax Correction", value=True)
 
+if st.sidebar.button("🔄 Reload LPR Engine & Clear Cache"):
+    st.cache_resource.clear()
+    importlib.reload(lpr_engine)
+    st.sidebar.success("Engine & Cache reloaded!")
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📌 Format Verification Rules")
-st.sidebar.info("Indian Standard Format: `[State 2L] [District 2D] [Series 1-3L] [Number 4D]` e.g. **MH12AB1234**")
+st.sidebar.info("Supported: Indian Standard (`MH12AB1234`), Bharat Series (`22BH1234AA`), & Universal International Plates (`JC 12 CG GP`)")
 
-@st.cache_resource
-def load_lpr_engine():
+def get_lpr_engine():
+    importlib.reload(lpr_engine)
     return LPREngine()
 
-engine = load_lpr_engine()
+engine = get_lpr_engine()
 
 # Tabs Interface
 tab1, tab2, tab3 = st.tabs(["📸 Image Recognition", "🎥 Video / Live Stream", "🧪 Syntax Corrector Lab"])
@@ -95,7 +108,7 @@ with tab1:
             st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image", use_column_width=True)
             
             if st.button("🔍 Run License Plate Recognition", type="primary"):
-                with st.spinner("Detecting plates and running positional OCR..."):
+                with st.spinner("Detecting plates and running multi-pass OCR..."):
                     start_time = time.time()
                     output = engine.process_image(image_bgr, conf_thresh=conf_threshold, ocr_engine=ocr_engine)
                     elapsed = time.time() - start_time
@@ -116,13 +129,18 @@ with tab1:
                 st.warning("No license plates detected. Try adjusting the confidence threshold slider.")
             else:
                 for idx, det in enumerate(output["detections"]):
-                    with st.expander(f"Plate #{idx+1}: {det['corrected_text']}", expanded=True):
+                    with st.expander(f"Plate #{idx+1}: {det['corrected_text'] or 'LICENSE PLATE'}", expanded=True):
                         c1, c2 = st.columns([1, 2])
                         with c1:
                             if det["crop_enhanced"] is not None and det["crop_enhanced"].size > 0:
                                 st.image(cv2.cvtColor(det["crop_enhanced"], cv2.COLOR_BGR2RGB), caption="Enhanced Crop", use_column_width=True)
                         with c2:
-                            st.write(f"**Detector Conf:** {det['det_conf']:.2f}")
+                            st.write(f"**Detector Conf:** `{det['det_conf']:.2f}`")
+                            
+                            plate_text = det["corrected_text"] or det["raw_text"] or "TEXT UNREADABLE"
+                            st.markdown(f"**Predicted License Plate Text:**")
+                            st.markdown(f'<div class="result-text-box">🔢 {plate_text}</div>', unsafe_allow_html=True)
+                            
                             st.write(f"**Raw OCR Output:** `{det['raw_text']}`")
                             st.write(f"**Syntax Corrected:** `{det['corrected_text']}`")
                             
@@ -189,7 +207,7 @@ with tab3:
     st.markdown("### 🧪 Test Positional Syntax Correction Engine")
     st.markdown("Simulate OCR output errors (e.g. `MH1ZAB1Z34` $\\rightarrow$ `MH12AB1234`) and see how syntax mapping resolves them.")
     
-    sample_inputs = ["MH1ZAB1Z34", "KAO5MBS678", "DL01CO1234", "22BH1234AA", "UP3ZAB9876"]
+    sample_inputs = ["MH1ZAB1Z34", "KAO5MBS678", "DL01CO1234", "22BH1234AA", "UP3ZAB9876", "JC 12 CG GP"]
     selected_sample = st.selectbox("Quick Preset Test Cases:", ["Custom Input..."] + sample_inputs)
     
     if selected_sample != "Custom Input...":

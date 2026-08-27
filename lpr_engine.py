@@ -7,8 +7,9 @@ Features:
 - Morphological TopHat / BlackHat + Sobel X Edge License Plate Localizer.
 - Multi-pass Binarization (CLAHE, Otsu Adaptive Binarization, Inversion).
 - 2-Line License Plate Splitter & Horizontal Stacker.
-- Multi-Engine OCR with Confidence Filtering & Space Preservation.
-- Syntax-Aware Character Correction for Indian & Universal International Plates.
+- Isolated Character Contour Segmentation & Left-to-Right Sorting Engine.
+- Multi-Engine OCR with Alphanumeric Allowlist & Emblem Badge Stripping.
+- Universal Character Prediction for Indian & International License Plates.
 """
 
 import cv2
@@ -51,6 +52,9 @@ INDIAN_STATES = {
     "MZ", "NL", "OD", "OR", "PB", "PY", "RJ", "SK", "TN", "TR", "TS", "UK",
     "UP", "WB", "BH"
 }
+
+# Country / State Emblem Badges to Ignore
+KNOWN_EMBLEM_BADGES = {"IND", "ZA", "GB", "EU", "USA", "UK", "NL", "GER", "FR", "AUS"}
 
 # Standard Indian License Plate Regex Patterns
 RE_INDIAN_STD = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$")
@@ -192,6 +196,46 @@ def preprocess_multi_pass(crop_bgr: np.ndarray, target_height: int = 128) -> Dic
     }
 
 
+def extract_character_boxes(crop_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """
+    Finds individual character contours sorted left-to-right across the plate crop.
+    """
+    h_crop, w_crop = crop_bgr.shape[:2]
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    
+    thresh = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 9)
+    cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    char_boxes = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = w / float(h)
+        rel_h = h / float(h_crop)
+        rel_w = w / float(w_crop)
+        
+        # Filter for characters (exclude tiny noise and full border)
+        if 0.22 <= rel_h <= 0.85 and 0.02 <= rel_w <= 0.35 and 0.12 <= aspect <= 1.6:
+            char_boxes.append((x, y, w, h))
+            
+    # Sort character boxes left-to-right along X axis
+    char_boxes = sorted(char_boxes, key=lambda b: b[0])
+    
+    # Merge overlapping bounding boxes
+    filtered = []
+    for box in char_boxes:
+        if not filtered:
+            filtered.append(box)
+        else:
+            prev_x, prev_y, prev_w, prev_h = filtered[-1]
+            x, y, w, h = box
+            # If current box overlaps heavily with previous box, skip duplicate
+            if abs(x - prev_x) > 6:
+                filtered.append(box)
+                
+    return filtered
+
+
 def crop_with_padding(image: np.ndarray, bbox: Tuple[int, int, int, int], margin_pct: float = 0.10) -> np.ndarray:
     """
     Extracts crop with safety margin padding around bbox coordinates (x1, y1, x2, y2).
@@ -220,14 +264,12 @@ def localize_license_plate_opencv(image_bgr: np.ndarray) -> List[Tuple[int, int,
     h_img, w_img = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     
-    # 1. Morphological Rectangular Kernel
     rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
     tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, rect_kernel)
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rect_kernel)
     
     enhanced = cv2.add(gray, cv2.subtract(tophat, blackhat))
     
-    # 2. Sobel X Gradient (high vertical edge density for character sequences)
     grad_x = cv2.Sobel(enhanced, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
     grad_x = np.absolute(grad_x)
     min_val, max_val = np.min(grad_x), np.max(grad_x)
@@ -253,7 +295,6 @@ def localize_license_plate_opencv(image_bgr: np.ndarray) -> List[Tuple[int, int,
         aspect_ratio = w / float(h)
         area = w * h
         
-        # License Plate Aspect Ratio typical range: 1.8 to 6.8
         if 1.8 <= aspect_ratio <= 6.8 and w >= 40 and h >= 12 and (area / float(w_img * h_img)) < 0.40:
             score = 1.0 - abs(aspect_ratio - 3.8) / 3.8
             conf = max(0.55, min(0.95, round(score, 2)))
@@ -294,12 +335,10 @@ class LPREngine:
         """
         boxes = []
         
-        # 1. Morphological TopHat / BlackHat License Plate Localizer (High Accuracy for Plates)
         morph_boxes = localize_license_plate_opencv(image_bgr)
         if morph_boxes:
-            boxes.extend(morph_boxes[:3])  # Top 3 plate candidates
+            boxes.extend(morph_boxes[:3])
 
-        # 2. YOLO Detector if trained model weights exist
         if self.detector is not None:
             try:
                 results = self.detector(image_bgr, conf=conf_thresh, verbose=False)
@@ -319,36 +358,67 @@ class LPREngine:
 
     def run_ocr_pass(self, crop_variants: Dict[str, np.ndarray], engine: str = "easyocr") -> str:
         """
-        Executes multi-pass OCR on image variants and picks the candidate with highest syntax score.
-        Preserves natural word spacing (e.g. 'JC 12 CG GP').
+        Executes multi-pass OCR on image variants + Isolated Character Segmentation Fallback.
+        Applies Alphanumeric Allowlist & Emblem Badge Stripping.
         """
         candidates = []
 
-        # 1. EasyOCR Multi-pass with Confidence & Space Preservation
+        # 1. EasyOCR Multi-pass with Alphanumeric Allowlist
         self.init_easyocr()
         if self.easyocr_reader is not None:
             for name, crop in crop_variants.items():
                 try:
-                    # Use detail=1 to extract individual text segments + confidence scores
-                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False)
+                    res = self.easyocr_reader.readtext(crop, detail=1, paragraph=False, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
                     valid_tokens = []
                     for bbox, text, prob in res:
                         cleaned_tok = re.sub(r"[^A-Z0-9]", "", text.upper())
-                        if len(cleaned_tok) >= 1 and prob >= 0.20:
+                        if len(cleaned_tok) >= 1 and prob >= 0.05:
                             valid_tokens.append(cleaned_tok)
+                            
                     if valid_tokens:
                         full_str = " ".join(valid_tokens)
                         candidates.append(full_str)
+                        
+                        if len(valid_tokens) > 1 and (valid_tokens[0] in KNOWN_EMBLEM_BADGES or len(valid_tokens[0]) <= 3):
+                            stripped_str = " ".join(valid_tokens[1:])
+                            candidates.append(stripped_str)
                 except Exception:
                     pass
 
-        # 2. PyTesseract Fallback Multi-pass
+        # 2. Isolated Character Contour Segmentation Fallback Engine
+        if not candidates or max([len(re.sub(r"[^A-Z0-9]", "", c)) for c in candidates], default=0) < 4:
+            base_crop = crop_variants.get("bgr")
+            if base_crop is not None and self.easyocr_reader is not None:
+                char_boxes = extract_character_boxes(base_crop)
+                h_crop, w_crop = base_crop.shape[:2]
+                segmented_chars = []
+                for x, y, w, h in char_boxes:
+                    pad = 4
+                    px1, py1 = max(0, x - pad), max(0, y - pad)
+                    px2, py2 = min(w_crop, x + w + pad), min(h_crop, y + h + pad)
+                    char_subcrop = base_crop[py1:py2, px1:px2]
+                    if char_subcrop.size == 0:
+                        continue
+                    char_scaled = cv2.resize(char_subcrop, (64, 64), interpolation=cv2.INTER_CUBIC)
+                    try:
+                        c_res = self.easyocr_reader.readtext(char_scaled, detail=0, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                        if c_res:
+                            c_str = re.sub(r"[^A-Z0-9]", "", "".join(c_res).upper())
+                            if c_str:
+                                segmented_chars.append(c_str[0])
+                    except Exception:
+                        pass
+                if len(segmented_chars) >= 3:
+                    seg_predicted = "".join(segmented_chars)
+                    candidates.append(seg_predicted)
+
+        # 3. PyTesseract Fallback Multi-pass
         if not candidates:
             try:
                 import pytesseract
                 for name, crop in crop_variants.items():
                     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    txt = pytesseract.image_to_string(gray, config="--psm 7")
+                    txt = pytesseract.image_to_string(gray, config="--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
                     txt_clean = re.sub(r"[^A-Z0-9 ]", "", txt.upper()).strip()
                     if txt_clean:
                         candidates.append(txt_clean)
@@ -358,18 +428,19 @@ class LPREngine:
         if not candidates:
             return ""
 
-        # Rank candidates by syntax correctness score and character count
-        best_candidate = candidates[0]
+        # Rank candidates: prioritize candidates that match valid plate syntax
+        valid_candidates = []
         for cand in candidates:
             corr, valid, fmt = correct_plate_syntax(cand)
             if valid:
-                return cand
-            cand_ns = re.sub(r"[^A-Z0-9]", "", cand)
-            best_ns = re.sub(r"[^A-Z0-9]", "", best_candidate)
-            if len(cand_ns) > len(best_ns):
-                best_candidate = cand
+                valid_candidates.append((cand, corr, fmt))
 
-        return best_candidate
+        if valid_candidates:
+            valid_candidates.sort(key=lambda x: len(re.sub(r"[^A-Z0-9]", "", x[1])), reverse=True)
+            return valid_candidates[0][1]
+
+        candidates.sort(key=lambda x: len(re.sub(r"[^A-Z0-9]", "", x)), reverse=True)
+        return candidates[0]
 
     def process_image(self, image_input: Union[str, np.ndarray], conf_thresh: float = 0.35, ocr_engine: str = "easyocr") -> Dict:
         """
