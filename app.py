@@ -19,6 +19,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Cross-version Streamlit image renderer
+def show_image(image_data, caption=None, target_st=st):
+    try:
+        target_st.image(image_data, caption=caption, use_container_width=True)
+    except TypeError:
+        try:
+            target_st.image(image_data, caption=caption, use_column_width=True)
+        except TypeError:
+            target_st.image(image_data, caption=caption)
+
 # Custom Styling (Dark Mode / Vibrant Accent)
 st.markdown("""
 <style>
@@ -111,7 +121,7 @@ with tab1:
             image_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
             
             if image_bgr is not None and image_bgr.size > 0:
-                st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image", use_column_width=True)
+                show_image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image")
                 
                 run_btn = st.button("🔍 Run License Plate Recognition", type="primary", key="run_rec_btn_key")
                 
@@ -131,7 +141,7 @@ with tab1:
             elapsed = st.session_state["elapsed"]
             vis_img = engine.draw_visualizations(output)
             
-            st.image(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB), caption=f"Detection Results ({elapsed*1000:.1f} ms)", use_column_width=True)
+            show_image(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB), caption=f"Detection Results ({elapsed*1000:.1f} ms)")
             
             st.markdown("### 📋 Recognition Results")
             if not output["detections"]:
@@ -143,7 +153,7 @@ with tab1:
                         c1, c2 = st.columns([1, 2])
                         with c1:
                             if det["crop_enhanced"] is not None and det["crop_enhanced"].size > 0:
-                                st.image(cv2.cvtColor(det["crop_enhanced"], cv2.COLOR_BGR2RGB), caption="Enhanced Crop", use_column_width=True)
+                                show_image(cv2.cvtColor(det["crop_enhanced"], cv2.COLOR_BGR2RGB), caption="Enhanced Crop")
                         with c2:
                             st.write(f"**Detector Conf:** `{det['det_conf']:.2f}`")
                             
@@ -190,7 +200,7 @@ with tab2:
                     output = engine.process_image(frame, conf_thresh=conf_threshold, ocr_engine=ocr_engine)
                     vis_frame = engine.draw_visualizations(output)
                     
-                    st_frame.image(cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+                    show_image(cv2.cvtColor(vis_frame, cv2.COLOR_BGR2RGB), target_st=st_frame)
                     
                     for d in output["detections"]:
                         detections_log.append({
