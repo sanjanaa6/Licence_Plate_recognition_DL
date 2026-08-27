@@ -73,12 +73,12 @@ st.markdown('<div class="sub-header">AI-Powered Detection with Deskewing, Prepro
 # Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
 
-conf_threshold = st.sidebar.slider("Detection Confidence Threshold", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
-ocr_engine = st.sidebar.selectbox("OCR Engine", ["easyocr", "tesseract_fallback"])
-enable_deskew = st.sidebar.checkbox("Enable Deskew / Rotation Correction", value=True)
-enable_syntax_correction = st.sidebar.checkbox("Enable Positional Syntax Correction", value=True)
+conf_threshold = st.sidebar.slider("Detection Confidence Threshold", min_value=0.1, max_value=0.9, value=0.35, step=0.05, key="conf_slider_key")
+ocr_engine = st.sidebar.selectbox("OCR Engine", ["easyocr", "tesseract_fallback"], index=0, key="ocr_selectbox_key")
+enable_deskew = st.sidebar.checkbox("Enable Deskew / Rotation Correction", value=True, key="deskew_check_key")
+enable_syntax_correction = st.sidebar.checkbox("Enable Positional Syntax Correction", value=True, key="syntax_check_key")
 
-if st.sidebar.button("🔄 Reload LPR Engine & Clear Cache"):
+if st.sidebar.button("🔄 Reload LPR Engine & Clear Cache", key="reload_btn_key"):
     st.cache_resource.clear()
     importlib.reload(lpr_engine)
     st.sidebar.success("Engine & Cache reloaded!")
@@ -101,7 +101,7 @@ with tab1:
     col_up, col_vis = st.columns([1, 1.2])
     
     with col_up:
-        uploaded_file = st.file_uploader("Upload a Vehicle Image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="plate_uploader")
+        uploaded_file = st.file_uploader("Upload a Vehicle Image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="plate_uploader_key")
         
         if uploaded_file is not None:
             # Fix Streamlit BytesIO EOF read issue using seek(0)
@@ -113,8 +113,7 @@ with tab1:
             if image_bgr is not None and image_bgr.size > 0:
                 st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image", use_column_width=True)
                 
-                # Auto-trigger recognition or run on button click
-                run_btn = st.button("🔍 Run License Plate Recognition", type="primary")
+                run_btn = st.button("🔍 Run License Plate Recognition", type="primary", key="run_rec_btn_key")
                 
                 if run_btn or "last_filename" not in st.session_state or st.session_state["last_filename"] != uploaded_file.name:
                     with st.spinner("Detecting plates and running multi-pass OCR..."):
@@ -162,7 +161,7 @@ with tab1:
 # ----------------- TAB 2: VIDEO RECOGNITION -----------------
 with tab2:
     st.markdown("### 🎥 Video Analytics Pipeline")
-    uploaded_video = st.file_uploader("Upload a Traffic Video (MP4 / AVI / MOV)", type=["mp4", "avi", "mov"])
+    uploaded_video = st.file_uploader("Upload a Traffic Video (MP4 / AVI / MOV)", type=["mp4", "avi", "mov"], key="video_uploader_key")
     
     if uploaded_video is not None:
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -171,7 +170,7 @@ with tab2:
         
         st.video(video_path)
         
-        if st.button("▶️ Process Video Frames", type="primary"):
+        if st.button("▶️ Process Video Frames", type="primary", key="proc_vid_btn_key"):
             cap = cv2.VideoCapture(video_path)
             st_frame = st.empty()
             log_container = st.empty()
@@ -218,12 +217,12 @@ with tab3:
     st.markdown("Simulate OCR output errors (e.g. `MH1ZAB1Z34` $\\rightarrow$ `MH12AB1234`) and see how syntax mapping resolves them.")
     
     sample_inputs = ["MH1ZAB1Z34", "KAO5MBS678", "DL01CO1234", "22BH1234AA", "UP3ZAB9876", "JC 12 CG GP"]
-    selected_sample = st.selectbox("Quick Preset Test Cases:", ["Custom Input..."] + sample_inputs)
+    selected_sample = st.selectbox("Quick Preset Test Cases:", ["Custom Input..."] + sample_inputs, key="preset_select_key")
     
     if selected_sample != "Custom Input...":
         test_text = selected_sample
     else:
-        test_text = st.text_input("Enter Raw OCR String:", value="MH1ZAB1Z34")
+        test_text = st.text_input("Enter Raw OCR String:", value="MH1ZAB1Z34", key="custom_text_key")
         
     if test_text:
         corrected, is_valid, fmt_type = correct_plate_syntax(test_text)
