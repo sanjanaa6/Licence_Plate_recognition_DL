@@ -36,15 +36,17 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
     .result-text-box {
-        font-size: 1.8rem;
-        font-weight: bold;
-        letter-spacing: 2px;
+        font-size: 2.0rem;
+        font-weight: 800;
+        letter-spacing: 3px;
         color: #10B981;
         background-color: #111827;
-        padding: 0.75rem 1rem;
+        padding: 0.85rem 1.25rem;
         border-radius: 0.5rem;
         border: 2px solid #059669;
-        margin: 0.5rem 0;
+        margin: 0.75rem 0;
+        text-align: center;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
     }
     .badge-valid {
         background-color: #059669;
@@ -99,22 +101,30 @@ with tab1:
     col_up, col_vis = st.columns([1, 1.2])
     
     with col_up:
-        uploaded_file = st.file_uploader("Upload a Vehicle Image", type=["jpg", "jpeg", "png", "bmp", "webp"])
+        uploaded_file = st.file_uploader("Upload a Vehicle Image", type=["jpg", "jpeg", "png", "bmp", "webp"], key="plate_uploader")
         
         if uploaded_file is not None:
-            image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            image_bgr = cv2.imdecode(image_bytes, 1)
+            # Fix Streamlit BytesIO EOF read issue using seek(0)
+            uploaded_file.seek(0)
+            file_bytes = uploaded_file.read()
+            image_bytes = np.frombuffer(file_bytes, dtype=np.uint8)
+            image_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
             
-            st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image", use_column_width=True)
-            
-            if st.button("🔍 Run License Plate Recognition", type="primary"):
-                with st.spinner("Detecting plates and running multi-pass OCR..."):
-                    start_time = time.time()
-                    output = engine.process_image(image_bgr, conf_thresh=conf_threshold, ocr_engine=ocr_engine)
-                    elapsed = time.time() - start_time
-                    
-                    st.session_state["output"] = output
-                    st.session_state["elapsed"] = elapsed
+            if image_bgr is not None and image_bgr.size > 0:
+                st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original Uploaded Image", use_column_width=True)
+                
+                # Auto-trigger recognition or run on button click
+                run_btn = st.button("🔍 Run License Plate Recognition", type="primary")
+                
+                if run_btn or "last_filename" not in st.session_state or st.session_state["last_filename"] != uploaded_file.name:
+                    with st.spinner("Detecting plates and running multi-pass OCR..."):
+                        start_time = time.time()
+                        output = engine.process_image(image_bgr, conf_thresh=conf_threshold, ocr_engine=ocr_engine)
+                        elapsed = time.time() - start_time
+                        
+                        st.session_state["output"] = output
+                        st.session_state["elapsed"] = elapsed
+                        st.session_state["last_filename"] = uploaded_file.name
 
     with col_vis:
         if "output" in st.session_state:
@@ -129,7 +139,8 @@ with tab1:
                 st.warning("No license plates detected. Try adjusting the confidence threshold slider.")
             else:
                 for idx, det in enumerate(output["detections"]):
-                    with st.expander(f"Plate #{idx+1}: {det['corrected_text'] or 'LICENSE PLATE'}", expanded=True):
+                    plate_text = det["corrected_text"] or det["raw_text"] or "TEXT UNREADABLE"
+                    with st.expander(f"Plate #{idx+1}: {plate_text}", expanded=True):
                         c1, c2 = st.columns([1, 2])
                         with c1:
                             if det["crop_enhanced"] is not None and det["crop_enhanced"].size > 0:
@@ -137,7 +148,6 @@ with tab1:
                         with c2:
                             st.write(f"**Detector Conf:** `{det['det_conf']:.2f}`")
                             
-                            plate_text = det["corrected_text"] or det["raw_text"] or "TEXT UNREADABLE"
                             st.markdown(f"**Predicted License Plate Text:**")
                             st.markdown(f'<div class="result-text-box">🔢 {plate_text}</div>', unsafe_allow_html=True)
                             
